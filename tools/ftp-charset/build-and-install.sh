@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 为 gvfs 的 FTP 后端编译 charset 支持，并部署到用户目录（不需要 root）
+# 从 windy664/gvfs（已含 charset 补丁的 fork）编译 gvfsd-ftp 并安装到用户目录。
+# 不需要 root：二进制和 mount 定义都放在 ~/.local 下，靠 GVFS_MOUNTABLE_DIR 生效。
 set -euo pipefail
 
 SRC_DIR="${1:-$HOME/.cache/gvfs-src}"
@@ -7,10 +8,14 @@ PREFIX="$HOME/.local"
 VENV="$HOME/.local/share/gvfs-build-venv"
 MOUNTS="$PREFIX/share/gvfs/mounts"
 LIBEXEC="$PREFIX/libexec/gvfs"
+CHARSET="${GVFS_FTP_CHARSET:-gbk}"
 
-echo "==> 获取 gvfs 1.62.0 源码"
-if [ ! -d "$SRC_DIR" ]; then
-  git clone --depth 1 --branch 1.62.0 https://github.com/GNOME/gvfs.git "$SRC_DIR"
+echo "==> 拉取源码（含 charset 补丁的 fork）"
+if [ ! -d "$SRC_DIR/.git" ]; then
+  git clone --depth 1 https://github.com/windy664/gvfs.git "$SRC_DIR"
+else
+  git -C "$SRC_DIR" fetch --depth 1 origin master
+  git -C "$SRC_DIR" reset --hard FETCH_HEAD
 fi
 
 echo "==> 准备构建工具"
@@ -19,13 +24,9 @@ if [ ! -x "$VENV/bin/meson" ]; then
   "$VENV/bin/pip" install meson ninja
 fi
 
-echo "==> 打补丁"
-cd "$SRC_DIR"
-git apply --check "$(dirname "$0")/../gvfs-1.62.0-ftp-charset.patch" 2>/dev/null \
-  || git apply "$(dirname "$0")/../gvfs-1.62.0-ftp-charset.patch"
-
 echo "==> 编译 gvfsd-ftp"
 export PATH="$VENV/bin:$PATH"
+cd "$SRC_DIR"
 meson setup build --prefix="$PREFIX" \
   -Dadmin=false -Dafc=false -Dcdda=false -Ddnssd=false -Dgoa=false \
   -Dgphoto2=false -Dhttp=false -Dmtp=false -Dnfs=false -Donedrive=false \
@@ -44,14 +45,14 @@ for m in ftp ftps ftpis; do
   sed -i "s|^Exec=.*|Exec=$LIBEXEC/gvfsd-ftp|" "$MOUNTS/$m.mount"
 done
 
-echo "==> 让 gvfs-daemon 使用用户级 mount 定义并指定编码"
+echo "==> 配置 gvfs-daemon（编码 $CHARSET）"
 mkdir -p "$HOME/.config/systemd/user/gvfs-daemon.service.d"
 cat > "$HOME/.config/systemd/user/gvfs-daemon.service.d/override.conf" <<CONF
 [Service]
 Environment=GVFS_MOUNTABLE_DIR=$MOUNTS
-Environment=GVFS_FTP_CHARSET=${GVFS_FTP_CHARSET:-gbk}
+Environment=GVFS_FTP_CHARSET=$CHARSET
 CONF
 systemctl --user daemon-reload
 systemctl --user restart gvfs-daemon.service
 
-echo "✓ 完成。Nautilus 里连 ftp://<服务器>/ 即可，编码由 GVFS_FTP_CHARSET 决定。"
+echo "✓ 完成。Nautilus 里连 ftp://<服务器>/ 即可。"
