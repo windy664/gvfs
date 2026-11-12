@@ -1,0 +1,159 @@
+diff --git a/daemon/gvfsbackendftp.c b/daemon/gvfsbackendftp.c
+index cc20edf..d63b281 100644
+--- a/daemon/gvfsbackendftp.c
++++ b/daemon/gvfsbackendftp.c
+@@ -392,6 +392,7 @@ g_vfs_backend_ftp_finalize (GObject *object)
+   g_mutex_clear (&ftp->mutex);
+ 
+   g_free (ftp->user);
++  g_free (ftp->charset);
+   gvfs_free_password (ftp->password);
+ 
+   g_clear_object (&ftp->server_identity);
+@@ -739,6 +740,20 @@ try_mount (GVfsBackend *backend,
+   ftp->addr = g_network_address_new (host, port);
+   ftp->user = g_strdup (g_mount_spec_get (mount_spec, "user"));
+   ftp->has_initial_user = ftp->user != NULL;
++
++  /* Character set of the server. Can be given as a mount option ("charset")
++   * or through the GVFS_FTP_CHARSET environment variable. When unset the
++   * server is assumed to use UTF-8, which is the historic gvfs behaviour. */
++  {
++    const char *charset = g_mount_spec_get (mount_spec, "charset");
++
++    if (charset == NULL || *charset == '\0')
++      charset = g_getenv ("GVFS_FTP_CHARSET");
++
++    if (charset != NULL && *charset != '\0' && g_ascii_strcasecmp (charset, "utf-8") != 0)
++      ftp->charset = g_strdup (charset);
++  }
++
+   if (port == g_vfs_backend_ftp_default_port (ftp))
+     ftp->host_display_name = g_strdup (host);
+   else
+diff --git a/daemon/gvfsbackendftp.h b/daemon/gvfsbackendftp.h
+index a3aa3ad..47398c9 100644
+--- a/daemon/gvfsbackendftp.h
++++ b/daemon/gvfsbackendftp.h
+@@ -99,6 +99,11 @@ struct _GVfsBackendFtp
+   char *                host_display_name;
+   GVfsFtpFile *         root;
+ 
++  /* Character set used by the server for file names (e.g. "gbk").
++   * NULL means the server is assumed to speak UTF-8 (the default behaviour).
++   * When set, file names are converted between this charset and UTF-8. */
++  char *                charset;
++
+   /* ftps support */
+   GVfsFtpTlsMode        tls_mode;
+   GSocketConnectable *  server_identity;        /* Server identity used for verification */
+diff --git a/daemon/gvfsftpdircache.c b/daemon/gvfsftpdircache.c
+index f3718fd..7a25e2e 100644
+--- a/daemon/gvfsftpdircache.c
++++ b/daemon/gvfsftpdircache.c
+@@ -656,6 +656,7 @@ g_vfs_ftp_dir_cache_funcs_process (GInputStream *        stream,
+   GVfsFtpFile *file;
+   char *line, *s;
+   gsize length;
++  GVfsBackendFtp *ftp = dir->backend;
+ 
+   /* protect against code reorg - in current code, error never is NULL */
+   g_assert (error != NULL);
+@@ -702,6 +703,22 @@ g_vfs_ftp_dir_cache_funcs_process (GInputStream *        stream,
+         }
+ 
+       s = g_strndup (result.fe_fname, result.fe_fnlen);
++
++      /* The server sends file names in its own character set. Convert them
++       * to UTF-8 so that GIO (and thus Nautilus) can display them. If the
++       * server speaks UTF-8 already, or the name cannot be converted, the
++       * raw bytes are kept as-is. */
++      if (ftp->charset != NULL)
++        {
++          gchar *converted = g_convert (s, -1, "UTF-8", ftp->charset, NULL, NULL, NULL);
++
++          if (converted != NULL)
++            {
++              g_free (s);
++              s = converted;
++            }
++        }
++
+       file = g_vfs_ftp_file_new_child  (dir, s, NULL);
+       g_free (s);
+       if (file == NULL)
+diff --git a/daemon/gvfsftpfile.c b/daemon/gvfsftpfile.c
+index 931cd80..b3a150c 100644
+--- a/daemon/gvfsftpfile.c
++++ b/daemon/gvfsftpfile.c
+@@ -36,12 +36,6 @@
+  * structure if you need to do operations on paths.
+  */
+ 
+-struct _GVfsFtpFile {
+-  GVfsBackendFtp *      backend;        /* the backend */
+-  char *                gvfs_path;      /* path in gvfs terms */
+-  char *                ftp_path;       /* path in ftp terms */
+-};
+-
+ /*** VFUNCS (that aren't yet made into vfuncs) ***/
+ 
+ /* FIXME: This most likely needs adaption to non-unix like directory structures.
+@@ -51,8 +45,20 @@ struct _GVfsFtpFile {
+  */
+ 
+ static char *
+-g_vfs_ftp_file_compute_ftp_path (const char *gvfs_path)
++g_vfs_ftp_file_compute_ftp_path (GVfsBackendFtp *ftp, const char *gvfs_path)
+ {
++  /* The path that gets sent to the server has to be encoded in the
++   * server's character set. When no charset is configured the path is
++   * passed through unchanged (historic behaviour: the server is assumed
++   * to speak UTF-8). */
++  if (ftp != NULL && ftp->charset != NULL)
++    {
++      gchar *converted = g_convert (gvfs_path, -1, ftp->charset, "UTF-8", NULL, NULL, NULL);
++
++      if (converted != NULL)
++        return converted;
++    }
++
+   return g_strdup (gvfs_path);
+ }
+ 
+@@ -94,7 +100,7 @@ g_vfs_ftp_file_new_from_gvfs (GVfsBackendFtp *ftp, const char *gvfs_path, GError
+   file = g_slice_new (GVfsFtpFile);
+   file->backend = g_object_ref (ftp);
+   file->gvfs_path = g_strdup (gvfs_path);
+-  file->ftp_path = g_vfs_ftp_file_compute_ftp_path (gvfs_path);
++  file->ftp_path = g_vfs_ftp_file_compute_ftp_path (ftp, gvfs_path);
+ 
+   return file;
+ }
+diff --git a/daemon/gvfsftpfile.h b/daemon/gvfsftpfile.h
+index 69903c5..1f580d9 100644
+--- a/daemon/gvfsftpfile.h
++++ b/daemon/gvfsftpfile.h
+@@ -27,6 +27,22 @@
+ 
+ G_BEGIN_DECLS
+ 
++/**
++ * GVfsFtpFile:
++ * @backend: the backend
++ * @gvfs_path: path in gvfs terms
++ * @ftp_path: path in ftp terms
++ *
++ * This structure maps between GVfs paths and the actual paths as used on an
++ * FTP server. The mapping may not be a 1-to-1 mapping, so always use this
++ * structure if you need to do operations on paths.
++ */
++struct _GVfsFtpFile {
++  GVfsBackendFtp *      backend;        /* the backend */
++  char *                gvfs_path;      /* path in gvfs terms */
++  char *                ftp_path;       /* path in ftp terms */
++};
++
+ GVfsFtpFile *     g_vfs_ftp_file_new_from_gvfs          (GVfsBackendFtp *       ftp,
+                                                          const char *           gvfs_path,
+                                                          GError **              error);
